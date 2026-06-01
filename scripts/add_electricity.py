@@ -59,6 +59,8 @@ import powerplantmatching as pm
 import pypsa
 import xarray as xr
 from pypsa.clustering.spatial import DEFAULT_ONE_PORT_STRATEGIES, normed_or_uniform
+from sklearn.preprocessing import StandardScaler
+from sklearn.cluster import AgglomerativeClustering
 
 from scripts._helpers import (
     PYPSA_V1,
@@ -365,17 +367,30 @@ def load_and_aggregate_powerplants(
 
     disaggregated = ppl[~to_aggregate].copy()
     disaggregated.index = (
-        disaggregated.bus
+        disaggregated.bus.astype(str)
         + " "
-        + disaggregated.carrier
+        + disaggregated.carrier.astype(str)
         + " "
         + disaggregated.index.astype(str)
         + " "
-        + disaggregated.name
+        + disaggregated.name.astype(str)
     )
-    disaggregated = disaggregated[aggregated.columns]
 
-    return pd.concat([aggregated, disaggregated])
+    common_cols = aggregated.columns.intersection(disaggregated.columns).tolist()
+    extra_cols = [
+        c for c in ["source_id", "damheight_m", "volume_mm3", "storagecapacity_mwh"]
+        if c in disaggregated.columns and c not in common_cols
+    ]
+
+    disaggregated = disaggregated[common_cols + extra_cols]
+
+    for col in extra_cols:
+        if col not in aggregated.columns:
+            aggregated[col] = np.nan
+
+    disaggregated = disaggregated.reindex(columns=aggregated.columns)
+
+    return pd.concat([aggregated, disaggregated], sort=False)
 
 
 def attach_load(
@@ -730,7 +745,457 @@ def attach_existing_batteries(
     )
     logger.info(f"Added {len(batt)} existing battery storage units\n({stats} MW)")
 
+def _fill_reservoir_missing_values(df: pd.DataFrame) -> pd.DataFrame:
+    
+    #safety check deletable
+    
+    df = df.copy()
 
+    df["damheight_m"] = pd.to_numeric(df["damheight_m"], errors="coerce")
+    df["volume_mm3"] = pd.to_numeric(df["volume_mm3"], errors="coerce")
+    df["p_nom"] = pd.to_numeric(df["p_nom"], errors="coerce")
+
+    median_head_country = df.groupby("country")["damheight_m"].median()
+    median_vol_country = df.groupby("country")["volume_mm3"].median()
+
+    median_head_global = df["damheight_m"].median(skipna=True)
+    median_vol_global = df["volume_mm3"].median(skipna=True)
+
+    for country in df["country"].dropna().unique():
+        mask_country = df["country"] == country
+
+        mask_head_nan = mask_country & df["damheight_m"].isna()
+        head_value = median_head_country.get(country, median_head_global)
+        df.loc[mask_head_nan, "damheight_m"] = head_value
+
+        mask_vol_nan = mask_country & df["volume_mm3"].isna()
+        vol_value = median_vol_country.get(country, median_vol_global)
+        df.loc[mask_vol_nan, "volume_mm3"] = vol_value
+
+    df.loc[df["damheight_m"] <= 0, "damheight_m"] = 1.0
+    df = df.loc[df["p_nom"].notna() & (df["p_nom"] > 0)].copy()
+
+    return df          
+
+def _safe_corr(x: pd.Series, y: pd.Series) -> float:
+    x = pd.to_numeric(x, errors="coerce")
+    y = pd.to_numeric(y, errors="coerce")
+
+    valid = x.notna() & y.notna()
+    x_valid = x.loc[valid]
+    y_valid = y.loc[valid]
+
+    if len(x_valid) < 2:
+        return 0.0
+
+    x_std = x_valid.std()
+    y_std = y_valid.std()
+
+    if pd.isna(x_std) or pd.isna(y_std) or x_std == 0 or y_std == 0:
+        return 0.0
+
+    return float(x_valid.corr(y_valid))
+
+
+def _build_hydro_clustering_features(
+    inflow_plants: pd.DataFrame,
+    plants: pd.DataFrame,
+    seasonal_weight: float = 1.0,
+    inflow_level_weight: float = 1.0,
+    max_hours_weight: float = 1.0,
+) -> pd.DataFrame:
+    plants = plants.copy()
+    inflow_plants = inflow_plants.copy()
+
+    inflow_plants = inflow_plants.loc[:, plants.index]
+
+    #Metric A: seasonal shape similarity to mean bus shape
+    #Each plant inflow is divided by its own mean inflow, then correlation is computed against the average normalized inflow shape of the bus
+    plant_mean_inflow = inflow_plants.mean(axis=0).replace(0.0, np.nan)
+    inflow_norm = inflow_plants.divide(plant_mean_inflow, axis=1)
+
+    bus_mean_shape = inflow_norm.mean(axis=1)
+
+    A = pd.DataFrame(index=plants.index)
+    A["seasonal_corr"] = [
+        _safe_corr(inflow_norm[col], bus_mean_shape) for col in plants.index
+    ]
+
+    #Metric B: inflow level relative to nominal capacity
+    # mean(inflow) / p_nom [equivalent to sum(inflow) / (len(inflow) * p_nom)]
+    # ---------------------------------------------------------
+    n_steps = len(inflow_plants.index)
+
+    inflow_level = (
+        inflow_plants.sum(axis=0) / (n_steps * plants["p_nom"])
+    ).replace([np.inf, -np.inf], np.nan)
+
+    B = pd.DataFrame(index=plants.index)
+    B["inflow_level"] = inflow_level
+
+    #Metric C: max_hours aka the volume
+    C = pd.DataFrame(index=plants.index)
+    C["max_hours"] = pd.to_numeric(
+        plants["max_hours_plant"], errors="coerce"
+    ).replace([np.inf, -np.inf], np.nan)
+
+    #Fill NaNs metric-wise
+    for df_block in [A, B, C]:
+        for col in df_block.columns:
+            if df_block[col].isna().all():
+                df_block[col] = 0.0
+            elif df_block[col].isna().any():
+                df_block[col] = df_block[col].fillna(df_block[col].median(skipna=True))
+
+    # Standardize each metric separately
+    scaler_A = StandardScaler()
+    A_std = pd.DataFrame(
+        scaler_A.fit_transform(A),
+        index=A.index,
+        columns=A.columns,
+    )
+
+    scaler_B = StandardScaler()
+    B_std = pd.DataFrame(
+        scaler_B.fit_transform(B),
+        index=B.index,
+        columns=B.columns,
+    )
+
+    scaler_C = StandardScaler()
+    C_std = pd.DataFrame(
+        scaler_C.fit_transform(C),
+        index=C.index,
+        columns=C.columns,
+    )
+
+    # Apply weights
+    A_std *= seasonal_weight
+    B_std *= inflow_level_weight
+    C_std *= max_hours_weight
+
+    X = pd.concat([A_std, B_std, C_std], axis=1)
+
+    return X
+
+
+def _cluster_reservoirs_within_bus(
+    bus_plants: pd.DataFrame,
+    inflow_bus: pd.DataFrame,
+    distance_threshold: float = 2.0,
+    seasonal_weight: float = 1.0,
+    inflow_level_weight: float = 1.0,
+    max_hours_weight: float = 1.0,
+) -> pd.Series:
+    
+    #function that creates reservoir clusters to manage their aggregation within the bus. 
+    #when `distance_threshold = 0`, each reservoir remains separate; 
+    #when `distance_threshold = inf`, all reservoirs within the same bus are aggregated together (no clusters).
+    bus_plants = bus_plants.copy()
+
+    if len(bus_plants) == 1:
+        return pd.Series(0, index=bus_plants.index, name="subcluster")
+
+    X = _build_hydro_clustering_features(
+        inflow_plants=inflow_bus,
+        plants=bus_plants,
+        seasonal_weight=seasonal_weight,
+        inflow_level_weight=inflow_level_weight,
+        max_hours_weight=max_hours_weight,
+    )
+
+    if len(bus_plants) == 2:
+        dist = np.linalg.norm(X.iloc[0].values - X.iloc[1].values)
+        if dist <= distance_threshold:
+            labels = np.array([0, 0], dtype=int)
+        else:
+            labels = np.array([0, 1], dtype=int)
+    else:
+        model = AgglomerativeClustering(
+            n_clusters=None,
+            distance_threshold=distance_threshold,
+            linkage="ward",
+        )
+        labels = model.fit_predict(X.values)
+
+    return pd.Series(labels, index=bus_plants.index, name="subcluster")
+
+def _compute_reservoir_max_hours(
+    df: pd.DataFrame,
+    reservoir_energy_efficiency: float = 0.70,
+) -> pd.DataFrame:
+    #function that converts volume into the max_hours parameter
+    df = df.copy()
+
+    df["storagecapacity_mwh"] = (
+        df["volume_mm3"] * 1e6
+        * df["damheight_m"]
+        * 9.81
+        * reservoir_energy_efficiency
+        * 1e-3
+        / 3600
+    )
+
+    df["max_hours_plant"] = (
+        df["storagecapacity_mwh"] / df["p_nom"]
+    ).replace([np.inf, -np.inf], np.nan)
+
+    return df
+
+
+def attach_hydro_GloFAS(
+    n: pypsa.Network,
+    costs: pd.DataFrame,
+    ppl: pd.DataFrame,
+    profile_hydro: str,
+    carriers: list,
+    **params,
+):
+    """
+    Attach hydro generators and storage units to the network using
+    plant-level GloFAS/ERA5-based hydro profiles.
+
+    Parameters
+    ----------
+    n : pypsa.Network
+        The PyPSA network to attach the hydro units to.
+    costs : pd.DataFrame
+        DataFrame containing the cost data.
+    ppl : pd.DataFrame
+        DataFrame containing the power plant data.
+    profile_hydro : str
+        Path to the plant-level hydro profile dataset.
+    carriers : list
+        List of hydro energy carriers.
+    **params :
+        Additional parameters for the GloFAS hydro workflow.
+    """
+
+    add_missing_carriers(n, carriers)
+    add_co2_emissions(n, costs, carriers)
+
+    ror_agg = ppl.query('carrier == "ror"').copy()
+    phs_agg = ppl.query('carrier == "PHS"').copy()
+    res_plants_all = ppl.query('carrier == "hydro"').copy()
+
+    for df in [ror_agg, phs_agg, res_plants_all]:
+        df.columns = df.columns.str.lower()
+
+    ds = xr.open_dataset(profile_hydro)
+
+    #Load raw hydro mapping
+    ppls_raw = pd.read_csv(snakemake.input.powerplants, index_col=0)
+
+    ppls_raw.columns = ppls_raw.columns.str.strip()
+    ppls_raw = ppls_raw.rename(columns={"Capacity": "p_nom"})
+
+    if "source_id" not in ppls_raw.columns:
+        raise ValueError("source_id missing in powerplants csv")
+
+    ppls_raw["source_id"] = ppls_raw["source_id"].astype(str).str.strip()
+
+    ppls_raw["carrier"] = ppls_raw["Technology"].replace({
+        "Run-Of-River": "ror",
+        "Reservoir": "hydro",
+        "Pumped Storage": "PHS",
+    })
+
+    ppls_raw = ppls_raw[ppls_raw["carrier"].isin(["ror", "hydro", "PHS"])].copy()
+
+    ppls_raw["group_key_agg"] = (
+        ppls_raw["bus"].astype(str) + " " + ppls_raw["carrier"].astype(str)
+    )
+
+    ppls_raw["group_key_disagg"] = (
+        ppls_raw["bus"].astype(str)
+        + " "
+        + ppls_raw["carrier"].astype(str)
+        + " "
+        + ppls_raw["source_id"]
+    )
+
+    p_max_pu_ror_agg = None
+
+    if not ror_agg.empty and "p_max_pu_ror" in ds:
+
+        p_max_pu_ror_plants = ds["p_max_pu_ror"].to_pandas()
+        p_max_pu_ror_plants.columns = p_max_pu_ror_plants.columns.astype(str)
+
+        ror_plants = ppls_raw[ppls_raw["carrier"] == "ror"].copy()
+
+        common = ror_plants["source_id"][ror_plants["source_id"].isin(p_max_pu_ror_plants.columns)]
+
+        ror_plants = ror_plants.set_index("source_id").loc[common].copy()
+        p_max_pu_ror_plants = p_max_pu_ror_plants[common]
+
+        ror_target_index = pd.Index(ror_agg.index.astype(str))
+
+        ror_plants["group_key"] = np.where(
+            ror_plants["group_key_disagg"].isin(ror_target_index),
+            ror_plants["group_key_disagg"],
+            ror_plants["group_key_agg"],
+        )
+
+        inflow_equiv = p_max_pu_ror_plants.multiply(
+            ror_plants["p_nom"], axis=1
+        )
+
+        inflow_equiv_agg = (
+            inflow_equiv.T
+            .groupby(ror_plants["group_key"])
+            .sum()
+            .T
+        )
+
+        p_nom_ror_agg = ror_plants.groupby("group_key")["p_nom"].sum()
+
+        p_max_pu_ror_agg = (
+            inflow_equiv_agg.divide(p_nom_ror_agg, axis=1)
+            .clip(upper=1.0)
+        )
+
+        p_max_pu_ror_agg = p_max_pu_ror_agg.reindex(columns=ror_agg.index)
+
+    #Reservoir custom aggregation inside each final bus
+    res_agg = None
+    inflow_res_agg = None
+
+    if not res_plants_all.empty and "inflow_reservoir" in ds:
+
+        if "source_id" not in res_plants_all.columns:
+            raise ValueError("source_id missing in ppl")
+
+        inflow_res_plants = ds["inflow_reservoir"].to_pandas()
+        inflow_res_plants.columns = inflow_res_plants.columns.astype(str).str.strip()
+
+        res_plants_all["source_id"] = (
+            pd.to_numeric(res_plants_all["source_id"], errors="coerce")
+            .astype("Int64")
+            .astype(str)
+        )
+
+        # safety fill missing data
+        res_plants_all = _fill_reservoir_missing_values(res_plants_all)
+        res_plants_all = _compute_reservoir_max_hours(res_plants_all)
+
+        common_mask = res_plants_all["source_id"].isin(inflow_res_plants.columns)
+        res_plants_use = res_plants_all.loc[common_mask].copy()
+
+        if res_plants_use.empty:
+            raise ValueError("No reservoir matched inflow")
+
+        inflow_res_use = inflow_res_plants[res_plants_use["source_id"]].copy()
+        inflow_res_use.columns = res_plants_use.index
+
+        subgroup_records = []
+
+        glofas_cfg = params.get("GloFAS_ERA5", {})
+
+        #Cluster separately inside each final bus
+        for bus, bus_plants in res_plants_use.groupby("bus"):
+
+            inflow_bus = inflow_res_use[bus_plants.index]
+
+            labels = _cluster_reservoirs_within_bus(
+                bus_plants=bus_plants,
+                inflow_bus=inflow_bus,
+                distance_threshold=glofas_cfg.get("reservoir_subcluster_distance_threshold", 2.0),
+                seasonal_weight=glofas_cfg.get("reservoir_subcluster_seasonal_weight", 0.5),
+                inflow_level_weight=glofas_cfg.get("reservoir_subcluster_inflow_level_weight", 1.75),
+                max_hours_weight=glofas_cfg.get("reservoir_subcluster_max_hours_weight", 0.75),
+            )
+
+            bus_plants = bus_plants.copy()
+            bus_plants["group_key_final"] = [
+                f"{bus} hydro sg{int(lbl)}" for lbl in labels
+            ]
+
+            subgroup_records.append(bus_plants)
+
+        res_plants_grouped = pd.concat(subgroup_records, axis=0)
+
+        #Aggregate inflow by subgroup
+        inflow_res_agg = (
+            inflow_res_use.T
+            .groupby(res_plants_grouped["group_key_final"])
+            .sum()
+            .T
+        )
+
+        p_nom_agg = res_plants_grouped.groupby("group_key_final")["p_nom"].sum()
+        reservoir_energy_agg = res_plants_grouped.groupby("group_key_final")["storagecapacity_mwh"].sum()
+
+        hydro_max_hours = (
+            reservoir_energy_agg / p_nom_agg
+        ).replace([np.inf, -np.inf], np.nan).fillna(6.0)
+
+        res_agg = pd.DataFrame({
+            "bus": res_plants_grouped.groupby("group_key_final")["bus"].first(),
+            "p_nom": p_nom_agg,
+            "max_hours": hydro_max_hours,
+        })
+
+        inflow_res_agg = inflow_res_agg.reindex(columns=res_agg.index)
+
+    #attach ror
+    if "ror" in carriers and not ror_agg.empty and p_max_pu_ror_agg is not None:
+
+        n.add(
+            "Generator",
+            ror_agg.index,
+            carrier="ror",
+            bus=ror_agg["bus"],
+            p_nom=ror_agg["p_nom"],
+            efficiency=costs.at["ror", "efficiency"],
+            capital_cost=costs.at["ror", "capital_cost"],
+            weight=ror_agg["p_nom"],
+            p_max_pu=p_max_pu_ror_agg,
+        )
+
+    #attach hydro
+    if "hydro" in carriers and res_agg is not None:
+        
+        fixed_soc_fraction = 0.5  #for results, not to be pulled to pypsa
+        target_soc = fixed_soc_fraction * (res_agg["p_nom"] * res_agg["max_hours"]) 
+
+        n.add(
+            "StorageUnit",
+            res_agg.index,
+            carrier="hydro",
+            bus=res_agg["bus"],
+            p_nom=res_agg["p_nom"],
+            max_hours=res_agg["max_hours"],
+            capital_cost=costs.at["hydro", "capital_cost"],
+            marginal_cost=costs.at["hydro", "marginal_cost"],
+            p_max_pu=1.0,
+            p_min_pu=0.0,
+            efficiency_dispatch=costs.at["hydro", "efficiency"],
+            state_of_charge_initial=target_soc, 
+            cyclic_state_of_charge=False, 
+            inflow=inflow_res_agg,
+        )
+
+        n.storage_units.loc[res_agg.index, "soc_target_custom"] = target_soc
+        
+    #attach phs
+    if "PHS" in carriers and not phs_agg.empty:
+
+        phs_agg["max_hours"] = phs_agg.get("max_hours", 6).replace([0, np.nan], 6)
+
+        n.add(
+            "StorageUnit",
+            phs_agg.index,
+            carrier="PHS",
+            bus=phs_agg["bus"],
+            p_nom=phs_agg["p_nom"],
+            max_hours=phs_agg["max_hours"],
+            capital_cost=costs.at["PHS", "capital_cost"],
+            efficiency_store=np.sqrt(costs.at["PHS", "efficiency"]),
+            efficiency_dispatch=np.sqrt(costs.at["PHS", "efficiency"]),
+            cyclic_state_of_charge=True,
+        )
+        
+        
 def attach_hydro(
     n: pypsa.Network,
     costs: pd.DataFrame,
@@ -880,6 +1345,8 @@ def attach_hydro(
         else:
             p_max_pu = 1
 
+        soc_initial = 0.5 * hydro["p_nom"] * hydro_max_hours
+
         n.add(
             "StorageUnit",
             hydro.index,
@@ -889,13 +1356,16 @@ def attach_hydro(
             max_hours=hydro_max_hours,
             capital_cost=costs.at["hydro", "capital_cost"],
             marginal_cost=costs.at["hydro", "marginal_cost"],
-            p_max_pu=p_max_pu,  # dispatch
-            p_min_pu=0.0,  # store
+            p_max_pu=p_max_pu,
+            p_min_pu=0.0,
             efficiency_dispatch=costs.at["hydro", "efficiency"],
             efficiency_store=0.0,
-            cyclic_state_of_charge=True,
+            state_of_charge_initial=soc_initial,
+            cyclic_state_of_charge=False,
             inflow=inflow_t.loc[:, hydro.index],
         )
+
+        n.storage_units.loc[hydro.index, "soc_target_custom"] = soc_initial
 
 
 def attach_renewable_powerplants(
@@ -1272,17 +1742,32 @@ if __name__ == "__main__":
     )
 
     if "hydro" in renewable_carriers:
-        p = params.renewable["hydro"]
-        carriers = p.pop("carriers", [])
-        attach_hydro(
-            n,
-            costs,
-            ppl,
-            snakemake.input.profile_hydro,
-            snakemake.input.hydro_capacities,
-            carriers,
-            **p,
-        )
+        p = params.renewable["hydro"].copy()
+
+        carriers = p.pop("carriers", ["ror", "PHS", "hydro"])
+
+        glofas_cfg = p.get("GloFAS_ERA5", {})
+        use_glofas = glofas_cfg.get("methods", False)
+
+        if use_glofas:
+            attach_hydro_GloFAS(
+                n,
+                costs,
+                ppl,
+                snakemake.input.profile_hydro,
+                carriers,
+                **p,
+            )
+        else:
+            attach_hydro(
+                n,
+                costs,
+                ppl,
+                snakemake.input.profile_hydro,
+                snakemake.input.hydro_capacities,
+                carriers,
+                **p,
+            )
 
     estimate_renewable_caps = params.electricity["estimate_renewable_capacities"]
     if estimate_renewable_caps["enable"]:

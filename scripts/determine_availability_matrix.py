@@ -65,6 +65,7 @@ import numpy as np
 import xarray as xr
 from atlite.gis import shape_availability
 from rasterio.plot import show
+import os
 
 from scripts._helpers import configure_logging, load_cutout, set_scenario_config
 
@@ -87,13 +88,28 @@ if __name__ == "__main__":
     technology = snakemake.wildcards.technology
     params = snakemake.params.renewable[technology]
 
+    def get_gebco_file():
+        original = str(snakemake.input.gebco)
+        fixed_candidates = [
+            original.replace("GEBCO_2014_2D.nc", "GEBCO_2014_2D_fixed.tif"),
+            original.replace(".nc", "_fixed.tif"),
+        ]
+
+        for candidate in fixed_candidates:
+            if os.path.exists(candidate):
+                logger.info("Using fixed GEBCO raster: %s", candidate)
+                return candidate
+
+        return original
+
     cutout = load_cutout(snakemake.input.cutout)
     regions = gpd.read_file(snakemake.input.regions)
+
     assert not regions.empty, (
         f"List of regions in {snakemake.input.regions} is empty, please "
         "disable the corresponding renewable technology"
     )
-    # do not pull up, set_index does not work if geo dataframe is empty
+
     regions = regions.set_index("name").rename_axis("bus")
 
     res = params.get("excluder_resolution", 100)
@@ -105,47 +121,71 @@ if __name__ == "__main__":
     for dataset in ["corine", "luisa"]:
         kwargs = {"nodata": 0} if dataset == "luisa" else {}
         settings = params.get(dataset, {})
+
         if not settings:
             continue
+
         if dataset == "luisa" and res > 50:
             logger.info(
                 "LUISA data is available at 50m resolution, "
                 f"but coarser {res}m resolution is used."
             )
+
         if isinstance(settings, list):
             settings = {"grid_codes": settings}
+
         if "grid_codes" in settings:
             codes = settings["grid_codes"]
             excluder.add_raster(
-                snakemake.input[dataset], codes=codes, invert=True, crs=3035, **kwargs
+                snakemake.input[dataset],
+                codes=codes,
+                invert=True,
+                crs=3035,
+                **kwargs,
             )
+
         if settings.get("distance", 0.0) > 0.0:
             codes = settings["distance_grid_codes"]
             buffer = settings["distance"]
             excluder.add_raster(
-                snakemake.input[dataset], codes=codes, buffer=buffer, crs=3035, **kwargs
+                snakemake.input[dataset],
+                codes=codes,
+                buffer=buffer,
+                crs=3035,
+                **kwargs,
             )
 
     if params.get("ship_threshold"):
         shipping_threshold = (
             params["ship_threshold"] * 8760 * 6
-        )  # approximation because 6 years of data which is hourly collected
+        )
         func = functools.partial(np.less, shipping_threshold)
         excluder.add_raster(
-            snakemake.input.ship_density, codes=func, crs=4326, allow_no_overlap=True
+            snakemake.input.ship_density,
+            codes=func,
+            crs=4326,
+            allow_no_overlap=True,
         )
 
+    gebco_file = get_gebco_file()
+
     if params.get("max_depth"):
-        # lambda not supported for atlite + multiprocessing
-        # use named function np.greater with partially frozen argument instead
-        # and exclude areas where: -max_depth > grid cell depth
         func = functools.partial(np.greater, -params["max_depth"])
-        excluder.add_raster(snakemake.input.gebco, codes=func, crs=4326, nodata=-1000)
+        excluder.add_raster(
+            gebco_file,
+            codes=func,
+            crs=4326,
+            nodata=-1000,
+        )
 
     if params.get("min_depth"):
         func = functools.partial(np.greater, -params["min_depth"])
         excluder.add_raster(
-            snakemake.input.gebco, codes=func, crs=4326, nodata=-1000, invert=True
+            gebco_file,
+            codes=func,
+            crs=4326,
+            nodata=-1000,
+            invert=True,
         )
 
     if params.get("min_shore_distance") is not None:
@@ -155,7 +195,9 @@ if __name__ == "__main__":
     if params.get("max_shore_distance") is not None:
         buffer = params["max_shore_distance"]
         excluder.add_geometry(
-            snakemake.input.country_shapes, buffer=buffer, invert=True
+            snakemake.input.country_shapes,
+            buffer=buffer,
+            invert=True,
         )
 
     logger.info(f"Calculate landuse availability for {technology}...")
@@ -179,8 +221,6 @@ if __name__ == "__main__":
         show(band, transform=transform, cmap="Greens", ax=ax)
         plt.savefig(snakemake.output[0].replace(".nc", ".png"), dpi=300)
 
-    # For Moldova and Ukraine: Overwrite parts not covered by Corine with
-    # externally determined available areas
     if "availability_matrix_MD_UA" in snakemake.input.keys():
         availability_MDUA = xr.open_dataarray(
             snakemake.input["availability_matrix_MD_UA"]

@@ -1219,7 +1219,33 @@ def add_co2_atmosphere_constraint(n, snapshots):
 
             n.model.add_constraints(lhs <= rhs, name=f"GlobalConstraint-{name}")
 
+def add_custom_reservoir_constraints(n, snapshots):
+    sus = n.storage_units
 
+    if "soc_target_custom" not in sus.columns:
+        return
+
+    target = sus["soc_target_custom"].dropna()
+
+    if target.empty:
+        return
+
+    m = n.model
+
+    for su_name, soc_target in target.items():
+        if su_name not in sus.index:
+            continue
+
+        soc_final = m.variables["StorageUnit-state_of_charge"].loc[
+            snapshots[-1], su_name
+        ]
+
+        m.add_constraints(
+            soc_final == soc_target,
+            name=f"final_soc_fixed_{su_name}",
+        )
+        
+        
 def extra_functionality(
     n: pypsa.Network, snapshots: pd.DatetimeIndex, planning_horizons: str | None = None
 ) -> None:
@@ -1277,6 +1303,7 @@ def extra_functionality(
     add_battery_constraints(n)
     add_lossy_bidirectional_link_constraints(n)
     add_pipe_retrofit_constraint(n)
+    add_custom_reservoir_constraints(n, snapshots)
     if n._multi_invest:
         add_carbon_constraint(n, snapshots)
         add_carbon_budget_constraint(n, snapshots)
