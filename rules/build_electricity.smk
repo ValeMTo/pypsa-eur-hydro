@@ -39,6 +39,7 @@ rule build_powerplants:
         regions_offshore=resources("regions_offshore_base_s_{clusters}.geojson"),
         powerplants=rules.retrieve_powerplants.output["powerplants"],
         custom_powerplants="data/custom_powerplants.csv",
+        glohydrores_powerplants="../../data/pypsa/GloHydroRes_vs1.csv",
     output:
         resources("powerplants_s_{clusters}.csv"),
     log:
@@ -444,22 +445,46 @@ if COUNTRY_RUNOFF_DATASET["source"] == "build":
         script:
             scripts("build_country_runoff.py")
 
+def hydro_saber_inflow(wildcards):
+    run_name = str(config["run"].get("name", "")).lower()
+    logger.info("hydro_saber_inflow config run.name: %s", run_name)
+
+    start = config["snapshots"]["start"]
+    year = str(start)[:4]
+
+    if "efas" in run_name:
+        path = f"../../data/pypsa/Europe_inflow_{year}_EFAS_SABER.nc"
+        logger.info("hydro_saber_inflow selected EFAS input: %s", path)
+        return path
+
+    if "glofas" in run_name:
+        path = f"../../data/pypsa/Europe_inflow_{year}_GloFAS_SABER.nc"
+        logger.info("hydro_saber_inflow selected GloFAS input: %s", path)
+        return path
+
+    logger.info("hydro_saber_inflow selected no SABER input.")
+    return []
 
 rule build_hydro_profile:
     input:
         country_shapes=resources("country_shapes.geojson"),
+        powerplants=resources("powerplants_s_{clusters}.csv"),
         eia_hydro_generation="data/eia_hydro_annual_generation.csv",
         eia_hydro_capacity="data/eia_hydro_annual_capacity.csv",
+        entsoe_hydro_annual_production=(
+            "../../data/hydro_workflow/hydro_global/ENTSOE/hydro_annual_production.csv"
+        ),
         era5_runoff=f"{COUNTRY_RUNOFF_DATASET['folder']}/era5-runoff-per-country.csv",
+        saber_inflow=hydro_saber_inflow,
         cutout=lambda w: input_cutout(
             w, config_provider("renewable", "hydro", "cutout")(w)
         ),
     output:
-        profile=resources("profile_hydro.nc"),
+        profile=resources("profile_{clusters}_hydro.nc"),
     log:
-        logs("build_hydro_profile.log"),
+        logs("build_hydro_profile_{clusters}.log"),
     benchmark:
-        benchmarks("build_hydro_profile")
+        benchmarks("build_hydro_profile_{clusters}"),
     resources:
         mem_mb=5000,
     params:
@@ -468,10 +493,9 @@ rule build_hydro_profile:
         snapshots=config_provider("snapshots"),
         drop_leap_day=config_provider("enable", "drop_leap_day"),
     message:
-        "Building hydropower profile"
+        "Building hydropower profile for {wildcards.clusters} clusters"
     script:
         scripts("build_hydro_profile.py")
-
 
 rule build_line_rating:
     input:
