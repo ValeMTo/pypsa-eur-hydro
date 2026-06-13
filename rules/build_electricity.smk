@@ -788,11 +788,7 @@ rule cluster_network:
 
 def input_profile_tech(w):
     return {
-        f"profile_{tech}": resources(
-            "profile_{clusters}_" + tech + ".nc"
-            if tech != "hydro"
-            else f"profile_{tech}.nc"
-        )
+        f"profile_{tech}": resources("profile_{clusters}_" + tech + ".nc")
         for tech in config_provider("electricity", "renewable_carriers")(w)
     }
 

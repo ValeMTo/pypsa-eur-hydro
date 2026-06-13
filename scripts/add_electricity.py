@@ -1091,24 +1091,31 @@ def attach_hydro_GloFAS(
 
         glofas_cfg = params.get("GloFAS_ERA5", {})
 
-        #Cluster separately inside each final bus
+        # Cluster separately inside each final bus only if requested.
+        # If reservoir_subclustering is false, keep each reservoir separate.
+        reservoir_subclustering = glofas_cfg.get("reservoir_subclustering", False)
+
         for bus, bus_plants in res_plants_use.groupby("bus"):
 
-            inflow_bus = inflow_res_use[bus_plants.index]
-
-            labels = _cluster_reservoirs_within_bus(
-                bus_plants=bus_plants,
-                inflow_bus=inflow_bus,
-                distance_threshold=glofas_cfg.get("reservoir_subcluster_distance_threshold", 2.0),
-                seasonal_weight=glofas_cfg.get("reservoir_subcluster_seasonal_weight", 0.5),
-                inflow_level_weight=glofas_cfg.get("reservoir_subcluster_inflow_level_weight", 1.75),
-                max_hours_weight=glofas_cfg.get("reservoir_subcluster_max_hours_weight", 0.75),
-            )
-
             bus_plants = bus_plants.copy()
-            bus_plants["group_key_final"] = [
-                f"{bus} hydro sg{int(lbl)}" for lbl in labels
-            ]
+
+            if reservoir_subclustering:
+                inflow_bus = inflow_res_use[bus_plants.index]
+
+                labels = _cluster_reservoirs_within_bus(
+                    bus_plants=bus_plants,
+                    inflow_bus=inflow_bus,
+                    distance_threshold=glofas_cfg.get("reservoir_subcluster_distance_threshold", 2.0),
+                    seasonal_weight=glofas_cfg.get("reservoir_subcluster_seasonal_weight", 0.5),
+                    inflow_level_weight=glofas_cfg.get("reservoir_subcluster_inflow_level_weight", 1.75),
+                    max_hours_weight=glofas_cfg.get("reservoir_subcluster_max_hours_weight", 0.75),
+                )
+
+                bus_plants["group_key_final"] = [
+                    f"{bus} hydro sg{int(lbl)}" for lbl in labels
+                ]
+            else:
+                bus_plants["group_key_final"] = bus_plants.index.astype(str)
 
             subgroup_records.append(bus_plants)
 
