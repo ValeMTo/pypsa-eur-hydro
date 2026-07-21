@@ -546,6 +546,7 @@ if __name__ == "__main__":
         .replace({"Solid Biomass": "Bioenergy", "Biogas": "Bioenergy"})
     )
     ppl_query = snakemake.params.powerplants_filter
+    planning_horizon = snakemake.config["scenario"]["planning_horizons"][0]
     if isinstance(ppl_query, str):
         ppl.query(ppl_query, inplace=True)
     
@@ -567,8 +568,8 @@ if __name__ == "__main__":
         verbose=True,
     )
     
-    ppl = ppl[((ppl["DateOut"] >= 2020) | (ppl["DateOut"].isna()))
-    & ((ppl["DateIn"] <= 2019) | (ppl["DateIn"].isna()))
+    ppl = ppl[((ppl["DateOut"] >= planning_horizon + 1) | (ppl["DateOut"].isna()))
+    & ((ppl["DateIn"] <= planning_horizon) | (ppl["DateIn"].isna()))
     ].copy()
 
     # add carriers from own powerplant files:
