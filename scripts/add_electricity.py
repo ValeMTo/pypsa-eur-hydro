@@ -1170,12 +1170,11 @@ def attach_hydro_GloFAS(
             p_max_pu=1.0,
             p_min_pu=0.0,
             efficiency_dispatch=costs.at["hydro", "efficiency"],
-            state_of_charge_initial=target_soc, 
-            cyclic_state_of_charge=False, 
+            cyclic_state_of_charge=True, 
             inflow=inflow_res_agg,
         )
 
-        n.storage_units.loc[res_agg.index, "soc_target_custom"] = target_soc
+        # soc_target_custom rimosso: PyPSA ciclico vero
         
     #attach phs
     if "PHS" in carriers and not phs_agg.empty:
@@ -1360,12 +1359,11 @@ def attach_hydro(
             p_min_pu=0.0,
             efficiency_dispatch=costs.at["hydro", "efficiency"],
             efficiency_store=0.0,
-            state_of_charge_initial=soc_initial,
-            cyclic_state_of_charge=False,
+            cyclic_state_of_charge=True,
             inflow=inflow_t.loc[:, hydro.index],
         )
 
-        n.storage_units.loc[hydro.index, "soc_target_custom"] = soc_initial
+        # soc_target_custom rimosso: PyPSA ciclico vero
 
 
 def attach_renewable_powerplants(

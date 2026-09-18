@@ -1303,7 +1303,7 @@ def extra_functionality(
     add_battery_constraints(n)
     add_lossy_bidirectional_link_constraints(n)
     add_pipe_retrofit_constraint(n)
-    add_custom_reservoir_constraints(n, snapshots)
+    # add_custom_reservoir_constraints(n, snapshots)
     if n._multi_invest:
         add_carbon_constraint(n, snapshots)
         add_carbon_budget_constraint(n, snapshots)
