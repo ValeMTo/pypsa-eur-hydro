@@ -1091,28 +1091,32 @@ def attach_hydro_GloFAS(
 
         glofas_cfg = params.get("GloFAS_ERA5", {})
 
-        #Cluster separately inside each final bus
-        for bus, bus_plants in res_plants_use.groupby("bus"):
+        if not glofas_cfg.get("reservoir_subclustering", False):
+            res_plants_grouped = res_plants_use.copy()
+            res_plants_grouped["group_key_final"] = res_plants_grouped.index
+        else:
+            #Cluster separately inside each final bus
+            for bus, bus_plants in res_plants_use.groupby("bus"):
 
-            inflow_bus = inflow_res_use[bus_plants.index]
+                inflow_bus = inflow_res_use[bus_plants.index]
 
-            labels = _cluster_reservoirs_within_bus(
-                bus_plants=bus_plants,
-                inflow_bus=inflow_bus,
-                distance_threshold=glofas_cfg.get("reservoir_subcluster_distance_threshold", 2.0),
-                seasonal_weight=glofas_cfg.get("reservoir_subcluster_seasonal_weight", 0.5),
-                inflow_level_weight=glofas_cfg.get("reservoir_subcluster_inflow_level_weight", 1.75),
-                max_hours_weight=glofas_cfg.get("reservoir_subcluster_max_hours_weight", 0.75),
-            )
+                labels = _cluster_reservoirs_within_bus(
+                    bus_plants=bus_plants,
+                    inflow_bus=inflow_bus,
+                    distance_threshold=glofas_cfg.get("reservoir_subcluster_distance_threshold", 2.0),
+                    seasonal_weight=glofas_cfg.get("reservoir_subcluster_seasonal_weight", 0.5),
+                    inflow_level_weight=glofas_cfg.get("reservoir_subcluster_inflow_level_weight", 1.75),
+                    max_hours_weight=glofas_cfg.get("reservoir_subcluster_max_hours_weight", 0.75),
+                )
 
-            bus_plants = bus_plants.copy()
-            bus_plants["group_key_final"] = [
-                f"{bus} hydro sg{int(lbl)}" for lbl in labels
-            ]
+                bus_plants = bus_plants.copy()
+                bus_plants["group_key_final"] = [
+                    f"{bus} hydro sg{int(lbl)}" for lbl in labels
+                ]
 
-            subgroup_records.append(bus_plants)
+                subgroup_records.append(bus_plants)
 
-        res_plants_grouped = pd.concat(subgroup_records, axis=0)
+            res_plants_grouped = pd.concat(subgroup_records, axis=0)
 
         #Aggregate inflow by subgroup
         inflow_res_agg = (

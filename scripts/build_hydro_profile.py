@@ -417,9 +417,20 @@ if __name__ == "__main__":
         hydro_ppls = hydro_ppls.rename(columns={"capacity": "p_nom"})
         hydro_ppls = add_qmax_turb(hydro_ppls, eff, q_min)
 
-        #Load inflow
-        logger.info("Opening SABER inflow file: %s", snakemake.input.saber_inflow)
-        inflow_saber = xr.open_dataarray(snakemake.input.saber_inflow)
+        #Load inflow (one file per weather year for a multi-year run, one file otherwise)
+        saber_inflow_paths = snakemake.input.saber_inflow
+        if isinstance(saber_inflow_paths, str):
+            saber_inflow_paths = [saber_inflow_paths]
+        else:
+            saber_inflow_paths = list(saber_inflow_paths)
+
+        logger.info("Opening SABER inflow file(s): %s", saber_inflow_paths)
+        inflow_saber = xr.concat(
+            [xr.open_dataarray(path) for path in saber_inflow_paths],
+            dim="time",
+        ).sortby("time")
+        # Align to the (possibly non-consecutive multi-year) snapshot time index.
+        inflow_saber = inflow_saber.sel(time=time)
 
         inflow_saber = inflow_saber.assign_coords(
             plant=inflow_saber.coords["plant"].astype(str)

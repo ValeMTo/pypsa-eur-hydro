@@ -449,18 +449,33 @@ def hydro_saber_inflow(wildcards):
     run_name = str(config["run"].get("name", "")).lower()
     logger.info("hydro_saber_inflow config run.name: %s", run_name)
 
+    # snapshots.start is a single "YYYY-MM-DD" string for a one-year run, or a
+    # list of such strings for a multi-year (e.g. climate-variability) run.
     start = config["snapshots"]["start"]
-    year = str(start)[:4]
+    starts = start if isinstance(start, list) else [start]
+    years = [str(s)[:4] for s in starts]
+
+    # Optional inflow variant (e.g. "FULLCAL" for full-period SABER calibration,
+    # used for 2050 scenario runs rather than causal/expanding-window validation).
+    hydro_cfg = config.get("renewable", {}).get("hydro", {})
+    variant = hydro_cfg.get("GloFAS_ERA5", {}).get("inflow_variant", "")
+    suffix = f"_{variant}" if variant else ""
 
     if "efas" in run_name:
-        path = f"../../data/pypsa/Europe_inflow_{year}_EFAS_SABER.nc"
-        logger.info("hydro_saber_inflow selected EFAS input: %s", path)
-        return path
+        paths = [
+            f"../../data/pypsa/Europe_inflow_{year}_EFAS_SABER{suffix}.nc"
+            for year in years
+        ]
+        logger.info("hydro_saber_inflow selected EFAS input(s): %s", paths)
+        return paths if len(paths) > 1 else paths[0]
 
     if "glofas" in run_name:
-        path = f"../../data/pypsa/Europe_inflow_{year}_GloFAS_SABER.nc"
-        logger.info("hydro_saber_inflow selected GloFAS input: %s", path)
-        return path
+        paths = [
+            f"../../data/pypsa/Europe_inflow_{year}_GloFAS_SABER{suffix}.nc"
+            for year in years
+        ]
+        logger.info("hydro_saber_inflow selected GloFAS input(s): %s", paths)
+        return paths if len(paths) > 1 else paths[0]
 
     logger.info("hydro_saber_inflow selected no SABER input.")
     return []

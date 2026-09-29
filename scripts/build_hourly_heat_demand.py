@@ -26,7 +26,7 @@ from scripts._helpers import (
 logger = logging.getLogger(__name__)
 
 
-def heat_dsm_profile(nodes, options):
+def heat_dsm_profile(nodes, options, dt_index):
     """
     Generate heat demand-side management (DSM) availability profile with periodic restrictions.
 
@@ -61,7 +61,7 @@ def heat_dsm_profile(nodes, options):
         weekly_profile[(np.arange(0, 7, 1) * 24 + int(i))] = 0
 
     dsm_profile = generate_periodic_profiles(
-        dt_index=pd.date_range(freq="h", **snakemake.params.snapshots, tz="UTC"),
+        dt_index=dt_index,
         nodes=nodes,
         weekly_profile=weekly_profile,
     )
@@ -116,7 +116,9 @@ if __name__ == "__main__":
             )
             if sector == "residential":
                 dsm_profile[f"{sector} {use}"] = heat_dsm_profile(
-                    daily_space_heat_demand.columns, sector_options
+                    daily_space_heat_demand.columns,
+                    sector_options,
+                    daily_space_heat_demand.index.tz_localize("UTC"),
                 )
         else:
             heat_demand[f"{sector} {use}"] = intraday_year_profile
