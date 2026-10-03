@@ -373,7 +373,8 @@ if __name__ == "__main__":
     fn = snakemake.input.eia_hydro_generation
     eia_stats = get_eia_annual_hydro_generation(fn, countries)
 
-    if "entsoe_hydro_annual_production" in snakemake.input:
+    # Namedlist `in` tests file paths, not input names: check the keys.
+    if "entsoe_hydro_annual_production" in snakemake.input.keys():
         eia_stats = override_eia_stats_with_entsoe(
             eia_stats=eia_stats,
             fn=snakemake.input.entsoe_hydro_annual_production,
